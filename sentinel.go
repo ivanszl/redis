@@ -158,8 +158,20 @@ func (c *SentinelClient) GetMasterAddrByName(name string) *StringSliceCmd {
 	return cmd
 }
 
+func (c *SentinelClient) Slaves(name string) *SliceCmd {
+	cmd := NewStringSliceCmd("sentinel", "slaves", name)
+	c.Process(cmd)
+	return cmd
+}
+
 func (c *SentinelClient) Sentinels(name string) *SliceCmd {
 	cmd := NewSliceCmd("sentinel", "sentinels", name)
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *SentinelClient) Ping(name string) *StatusCmd {
+	cmd := NewStatusCmd("ping")
 	c.Process(cmd)
 	return cmd
 }
@@ -213,15 +225,7 @@ func (c *sentinelFailover) MasterAddr() (string, error) {
 	return addr, nil
 }
 
-func (c *sentinelFailover) masterAddr() (string, error) {
-	addr := c.getMasterAddr()
-	if addr != "" {
-		return addr, nil
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+func (c *sentinelFailover) selectSentinel(fn func(*SentinelClient) error) error {
 	for i, sentinelAddr := range c.sentinelAddrs {
 		sentinel := NewSentinelClient(&Options{
 			Addr: sentinelAddr,
@@ -240,23 +244,53 @@ func (c *sentinelFailover) masterAddr() (string, error) {
 			TLSConfig: c.opt.TLSConfig,
 		})
 
-		masterAddr, err := sentinel.GetMasterAddrByName(c.masterName).Result()
-		if err != nil {
-			internal.Logf("sentinel: GetMasterAddrByName master=%q failed: %s",
+		if fn != nil{
+			if err := fn(sentinel) {
+			_ = sentinel.Close()
+				continue
+			}
+		} else {
+			_, err := sentinel.Ping().Result()
+			if err != nil {
+				internal.Logf("sentinel: Ping master=%q failed: %s",
 				c.masterName, err)
 			_ = sentinel.Close()
 			continue
+			}
 		}
 
 		// Push working sentinel to the top.
 		c.sentinelAddrs[0], c.sentinelAddrs[i] = c.sentinelAddrs[i], c.sentinelAddrs[0]
 		c.setSentinel(sentinel)
+		return nil
+	}
+	return errors.New("redis: all sentinels are unreachable")
+}
 
-		addr := net.JoinHostPort(masterAddr[0], masterAddr[1])
+func (c *sentinelFailover) masterAddr() (string, error) {
+	addr := c.getMasterAddr()
+	if addr != "" {
 		return addr, nil
 	}
 
-	return "", errors.New("redis: all sentinels are unreachable")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var masterAddr []string
+	err := c.selectSentinel(func(sentinel *SentinelClient) error{
+		masterAddr, err := sentinel.GetMasterAddrByName(c.masterName).Result()
+		if err != nil {
+			internal.Logf("sentinel: GetMasterAddrByName master=%q failed: %s",
+				c.masterName, err)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	addr := net.JoinHostPort(masterAddr[0], masterAddr[1])
+	return addr, nil
 }
 
 func (c *sentinelFailover) getMasterAddr() string {
